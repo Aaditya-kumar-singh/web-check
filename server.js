@@ -261,6 +261,6 @@ const printMessage = () => {
 };
 
 // Create server
-app.listen(port, () => {
+app.listen(port, process.env.HOST || '0.0.0.0', () => {
   printMessage();
 });
