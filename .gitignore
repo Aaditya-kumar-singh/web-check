@@ -22,6 +22,7 @@ dist/
 #         DEPENDENCIES
 # ------------------------
 node_modules/
+.web-check-yarn-cache/
 .yarn/cache/
 .yarn/unplugged/
 .yarn/build-state.yml

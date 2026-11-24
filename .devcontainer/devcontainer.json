@@ -1,0 +1,31 @@
+{
+  "name": "Web-Check",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "node",
+  "features": {
+    "ghcr.io/devcontainers/features/sshd:1": {}
+  },
+  "forwardPorts": [
+    3000
+  ],
+  "portsAttributes": {
+    "3000": {
+      "label": "Web-Check",
+      "onAutoForward": "silent"
+    }
+  },
+  "containerEnv": {
+    "PUPPETEER_SKIP_DOWNLOAD": "true",
+    "NODE_CHROMIUM_SKIP_INSTALL": "true",
+    "CHROME_PATH": "/usr/bin/chromium",
+    "CHROMIUM_BIN": "/usr/bin/chromium",
+    "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium",
+    "PORT": "3000",
+    "HOST": "0.0.0.0",
+    "API_ENABLE_RATE_LIMIT": "true",
+    "API_DISABLED_CHECKS": "ports,trace-route",
+    "TRUST_PROXY": "false"
+  }
+}

@@ -3,90 +3,73 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$healthUrl = 'http://127.0.0.1:3000/healthz'
-$appUrl = 'http://127.0.0.1:3000/check'
+$repo = 'Aaditya-kumar-singh/web-check'
+$displayName = 'Web-Check'
+$mutex = New-Object System.Threading.Mutex($false, 'Local\AadityaWebCheckStart')
+if (-not $mutex.WaitOne(0)) { exit 0 }
 
-function Test-WebCheckReady {
-  try {
-    $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2
-    return $health.status -eq 'ok' -and $health.ready -eq $true
-  } catch {
-    return $false
-  }
+function Invoke-Gh {
+  param([string[]]$Arguments)
+  $result = & gh @Arguments
+  if ($LASTEXITCODE -ne 0) { throw "GitHub CLI failed: $($Arguments -join ' ')" }
+  return $result
 }
 
 try {
-  Set-Location $repo
-  if (Test-WebCheckReady) {
-    Write-Host 'Web-Check is already running.'
-    if (-not $NoBrowser) { Start-Process $appUrl }
-    exit 0
+  Get-Command gh -ErrorAction Stop | Out-Null
+  Write-Host 'Connecting to GitHub Codespaces...'
+  # The first run needs the user's approval for the Codespaces OAuth scope.
+  $ErrorActionPreference = 'Continue'
+  & gh api user/codespaces --jq '.total_count' 2>$null | Out-Null
+  $hasAccess = $LASTEXITCODE -eq 0
+  $ErrorActionPreference = 'Stop'
+  if (-not $hasAccess) {
+    if ($NoBrowser) { throw 'Authorize Codespaces with: gh auth refresh -h github.com -s codespace' }
+    Write-Host 'Authorize GitHub Codespaces in the browser to continue.'
+    & gh auth refresh -h github.com -s codespace
+    if ($LASTEXITCODE -ne 0) { throw 'Codespaces authorization was not completed.' }
   }
 
-  if (Get-NetTCPConnection -State Listen -LocalPort 3000 -ErrorAction SilentlyContinue) {
-    throw 'Port 3000 is in use. Close the other app before starting Web-Check.'
+  $spaces = Invoke-Gh -Arguments @('api','--paginate','user/codespaces','--jq','.codespaces[] | [.repository.full_name,.display_name,.name] | @tsv')
+  $name = $spaces | ForEach-Object { $fields = $_ -split "`t"; if ($fields[0] -eq $repo -and $fields[1] -eq $displayName) { $fields[2] } } | Select-Object -First 1
+  if (-not $name) {
+    if ($NoBrowser) { throw 'No Web-Check Codespace exists yet.' }
+    Write-Host 'Creating a Codespace uses your GitHub compute and storage quota.'
+    if ((Read-Host 'Create one remote machine now? [y/N]') -ne 'y') { exit 0 }
+    $repoId = Invoke-Gh -Arguments @('api',"repos/$repo",'--jq','.id')
+    $machine = Invoke-Gh -Arguments @('api',"repos/$repo/codespaces/machines",'--jq','.machines | sort_by(.cpus, .memory_in_bytes) | .[0].name')
+    if (-not $machine -or $machine -eq 'null') { throw 'No Codespaces machine is available for this repository.' }
+    $name = Invoke-Gh -Arguments @('api','--method','POST','user/codespaces','-F',"repository_id=$repoId",'-f','ref=master','-f',"machine=$machine",'-f',"display_name=$displayName",'-F','idle_timeout_minutes=10','--jq','.name')
   }
 
-  $node = (Get-Command node.exe -ErrorAction Stop).Source
-  $corepack = (Get-Command corepack -ErrorAction Stop).Source
-  if (-not (Test-Path (Join-Path $repo 'public\favicon.ico'))) {
-    throw 'Web-Check source files are missing.'
+  $state = Invoke-Gh -Arguments @('api',"user/codespaces/$name",'--jq','.state')
+  if ($state -eq 'Shutdown') {
+    Invoke-Gh -Arguments @('api','--method','POST',"user/codespaces/$name/start",'--jq','.state') | Out-Null
   }
-
-  # Get upstream updates from your fork without overriding uncommitted work.
-  if (-not (git status --porcelain)) {
-    Write-Host 'Checking your GitHub fork for updates...'
-    $env:GIT_TERMINAL_PROMPT = '0'
-    git pull --ff-only origin master
-    if ($LASTEXITCODE -ne 0) { Write-Warning 'Could not update; using the existing local code.' }
-  } else {
-    Write-Warning 'Local changes found; skipping automatic Git update.'
+  for ($i=0; $i -lt 120; $i++) {
+    $state = Invoke-Gh -Arguments @('api',"user/codespaces/$name",'--jq','.state')
+    if ($state -eq 'Available') { break }
+    if ($state -in @('Failed','Deleted','Archived','Unavailable')) { throw "Codespace is $state." }
+    Start-Sleep -Seconds 5
   }
+  if ($state -ne 'Available') { throw "Codespace is not ready: $state." }
 
-  $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-  if (-not (Test-Path $chrome)) { $chrome = 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' }
-  if (-not (Test-Path $chrome)) { throw 'Chrome or Edge is needed for browser-based checks.' }
+  Write-Host 'Building or starting Web-Check on the GitHub machine...'
+  & gh codespace ssh -c $name -- 'bash /workspaces/web-check/.devcontainer/start.sh'
+  if ($LASTEXITCODE -ne 0) { throw 'Remote Web-Check did not start.' }
 
-  $env:CHROME_PATH = $chrome
-  $env:CHROMIUM_BIN = $chrome
-  $env:PUPPETEER_EXECUTABLE_PATH = $chrome
-  $env:PUPPETEER_SKIP_DOWNLOAD = 'true'
-  $env:HOST = '127.0.0.1'
-  $env:PORT = '3000'
-  $env:TRUST_PROXY = 'false'
-  $env:API_ENABLE_RATE_LIMIT = 'true'
-  $env:API_DISABLED_CHECKS = 'ports,trace-route'
-  $env:API_CORS_ORIGIN = 'http://127.0.0.1:3000'
-
-  $revision = (git rev-parse HEAD).Trim()
-  $stamp = Join-Path $repo '.git\web-check-last-built'
-  $builtRevision = if (Test-Path $stamp) { (Get-Content $stamp -Raw).Trim() } else { '' }
-  if (-not (Test-Path 'node_modules') -or -not (Test-Path 'dist') -or $builtRevision -ne $revision) {
-    Write-Host 'Installing dependencies and building Web-Check. The first start may take longer...'
-    & $corepack yarn install --frozen-lockfile --non-interactive --network-timeout 120000
-    if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
-    & $corepack yarn build
-    if ($LASTEXITCODE -ne 0) { throw 'Web-Check build failed.' }
-    Set-Content -Path $stamp -Value $revision -NoNewline
-  }
-
-  $logDir = Join-Path $repo 'logs'
-  [void](New-Item -ItemType Directory -Path $logDir -Force)
-  Write-Host 'Starting Web-Check locally on port 3000...'
-  $process = Start-Process -FilePath $node -ArgumentList @('server.js') -WorkingDirectory $repo -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logDir 'web-check.out.log') -RedirectStandardError (Join-Path $logDir 'web-check.err.log')
-  for ($i = 0; $i -lt 90; $i++) {
-    Start-Sleep -Milliseconds 500
-    if (Test-WebCheckReady) {
-      Write-Host 'Web-Check ready at' $appUrl -ForegroundColor Green
-      if (-not $NoBrowser) { Start-Process $appUrl }
-      exit 0
-    }
-    if ($process.HasExited) { break }
-  }
-  throw "Web-Check did not become ready. See $logDir for details."
+  # Ports are private by default; explicitly preserve private visibility.
+  Invoke-Gh -Arguments @('codespace','ports','visibility','3000:private','-c',$name) | Out-Null
+  $url = Invoke-Gh -Arguments @('codespace','ports','-c',$name,'--json','sourcePort,browseUrl','--jq','.[] | select(.sourcePort == 3000) | .browseUrl') | Select-Object -First 1
+  if (-not $url) { throw 'GitHub did not return a private browser URL for port 3000.' }
+  $url = $url.TrimEnd('/') + '/check'
+  Write-Host "Web-Check ready: $url"
+  if (-not $NoBrowser) { Start-Process $url }
 } catch {
   Write-Host "Web-Check launcher error: $($_.Exception.Message)" -ForegroundColor Red
   if (-not $NoBrowser) { Read-Host 'Press Enter to close this window' | Out-Null }
   exit 1
+} finally {
+  $mutex.ReleaseMutex()
+  $mutex.Dispose()
 }
