@@ -54,15 +54,19 @@ try {
   }
   if ($state -ne 'Available') { throw "Codespace is not ready: $state." }
 
-  Write-Host 'Building or starting Web-Check on the GitHub machine...'
-  & gh codespace ssh -c $name -- 'bash /workspaces/web-check/.devcontainer/start.sh'
-  if ($LASTEXITCODE -ne 0) { throw 'Remote Web-Check did not start.' }
+  # Resolve the private origin first: SSH does not inherit Codespaces metadata.
+  $port = (Invoke-Gh -Arguments @('codespace','ports','-c',$name,'--json','sourcePort,browseUrl,visibility') | ConvertFrom-Json) | Where-Object sourcePort -eq 3000 | Select-Object -First 1
+  if (-not $port -or $port.visibility -ne 'private') { throw 'GitHub did not return a private port 3000.' }
+  $uri = [uri]$port.browseUrl
+  $prefix = $name + '-3000.'
+  if ($name -notmatch '^[a-z0-9-]+$' -or $uri.Scheme -ne 'https' -or -not $uri.Host.StartsWith($prefix)) { throw 'Invalid Codespaces port URL.' }
+  $domain = $uri.Host.Substring($prefix.Length)
+  if ($domain -notmatch '^[a-z0-9.-]+$') { throw 'Invalid forwarding domain.' }
 
-  # Ports are private by default; explicitly preserve private visibility.
-  Invoke-Gh -Arguments @('codespace','ports','visibility','3000:private','-c',$name) | Out-Null
-  $url = Invoke-Gh -Arguments @('codespace','ports','-c',$name,'--json','sourcePort,browseUrl','--jq','.[] | select(.sourcePort == 3000) | .browseUrl') | Select-Object -First 1
-  if (-not $url) { throw 'GitHub did not return a private browser URL for port 3000.' }
-  $url = $url.TrimEnd('/') + '/check'
+  Write-Host 'Building or starting Web-Check on the GitHub machine...'
+  & gh codespace ssh -c $name -- "CODESPACE_NAME=$name GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN=$domain bash /workspaces/web-check/.devcontainer/start.sh"
+  if ($LASTEXITCODE -ne 0) { throw 'Remote Web-Check did not start.' }
+  $url = $uri.GetLeftPart([UriPartial]::Authority) + '/check'
   Write-Host "Web-Check ready: $url"
   if (-not $NoBrowser) { Start-Process $url }
 } catch {
